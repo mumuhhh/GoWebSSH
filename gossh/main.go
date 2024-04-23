@@ -11,7 +11,6 @@ import (
 	"io/fs"
 	"log"
 	"math/rand"
-	"net"
 	"net/http"
 	"os"
 	"path"
@@ -681,10 +680,7 @@ func (s Status) DELETE(c *gin.Context) {
 
 	sshConn, ok := clients.Load(sessionId)
 	if ok {
-		_ = sshConn.(*Ssh).sshClient.Close()
-		_ = sshConn.(*Ssh).sftpClient.Close()
-		_ = sshConn.(*Ssh).sshSession.Close()
-		_ = sshConn.(*Ssh).ws.Close()
+		_ = sshConn.(*Ssh).Close()
 		clients.Delete(sessionId)
 	}
 
@@ -706,13 +702,27 @@ type SshInfo struct {
 
 type Ssh struct {
 	SshInfo
-	Timeout    time.Time       `json:"timeout"`
-	sshClient  *ssh.Client     //ssh客户端
-	sftpClient *sftp.Client    //sftp客户端
-	sshSession *ssh.Session    //ssh会话
-	ws         *websocket.Conn // websocket 连接
+	Timeout    time.Time    `json:"timeout"`
+	sshClient  *ssh.Client  //ssh客户端
+	sftpClient *sftp.Client //sftp客户端
+	sshSession *ssh.Session //ssh会话
 
 	lock *sync.RWMutex
+}
+
+func (s *Ssh) Close() (err error) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+	if s.sshSession != nil {
+		err = s.sshSession.Close()
+	}
+	if s.sftpClient != nil {
+		err = s.sftpClient.Close()
+	}
+	if s.sshClient != nil {
+		err = s.sshClient.Close()
+	}
+	return
 }
 
 func (s *Ssh) GetTimeout() time.Time {
@@ -720,6 +730,13 @@ func (s *Ssh) GetTimeout() time.Time {
 	timeout := s.Timeout
 	s.lock.RUnlock()
 	return timeout
+}
+
+func (s *Ssh) GetSshSession() *ssh.Session {
+	s.lock.RLock()
+	session := s.sshSession
+	s.lock.RUnlock()
+	return session
 }
 
 func (s *Ssh) GetSshInfo() SshInfo {
@@ -748,77 +765,79 @@ func NewClient(ip string, username string, password string, port int, shell, ses
 }
 
 // MarshalJSON 重写序列化方法
-func (s Ssh) MarshalJSON() ([]byte, error) {
-	type Alias Ssh
+func (s SshInfo) MarshalJSON() ([]byte, error) {
+	type Alias SshInfo
 	return json.Marshal(&struct {
 		Alias
-		Timeout   string `json:"timeout"`
 		StartTime string `json:"start_time"`
 	}{
 		Alias:     (Alias)(s),
-		Timeout:   s.Timeout.Format("2006-01-02 15:04:05"),
 		StartTime: s.StartTime.Format("2006-01-02 15:04:05"),
 	})
 }
 
 // 连接主机
-func (s *Ssh) connect() error {
-	defer func() {
-		if err := recover(); err != nil {
-			logger.Error(err)
+func (s *Ssh) Connect() (sshSession *ssh.Session, err error) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	if s.sshClient == nil {
+		config := ssh.ClientConfig{
+			User:            s.Username,
+			Auth:            []ssh.AuthMethod{ssh.Password(s.Password)},
+			HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+			Timeout:         30 * time.Second,
 		}
-	}()
+		if s.sshClient, err = ssh.Dial("tcp", fmt.Sprintf("%s:%d", s.IP, s.Port), &config); err != nil {
+			return nil, err
+		}
 
-	config := ssh.ClientConfig{
-		User: s.Username,
-		Auth: []ssh.AuthMethod{ssh.Password(s.Password)},
-		HostKeyCallback: func(hostname string, remote net.Addr, key ssh.PublicKey) error {
-			return nil
-		},
-		Timeout: 30 * time.Second,
-	}
-	addr := fmt.Sprintf("%s:%d", s.IP, s.Port)
-	sshClient, err := ssh.Dial("tcp", addr, &config)
-	if err != nil {
-		return err
-	}
+		//使用sshClient构建sftpClient
+		if s.sftpClient, err = sftp.NewClient(s.sshClient); err != nil {
+			return nil, err
+		}
 
-	s.sshClient = sshClient
-	//使用sshClient构建sftpClient
-	var sftpClient *sftp.Client
-	if sftpClient, err = sftp.NewClient(sshClient); err != nil {
-		logger.Error("create sftp sshClient error:", err)
+		if s.sshSession, err = s.sshClient.NewSession(); err != nil {
+			return nil, err
+		}
 	}
-	s.sftpClient = sftpClient
-	return nil
+	return s.sshSession, nil
+}
+
+func ReceiveToWriter(rw *websocket.Conn, w io.Writer) (err error) {
+	var msg []byte
+	for {
+		if err = websocket.Message.Receive(rw, &msg); err != nil {
+			break
+		}
+		if _, err = w.Write(msg); err != nil {
+			break
+		}
+	}
+	return
 }
 
 // RunTerminal 运行一个终端
-func (s *Ssh) RunTerminal(shell string, stdout, stderr io.Writer, stdin io.Reader, w, h int, ws *websocket.Conn) error {
-	if s.sshClient == nil {
-		if err := s.connect(); err != nil {
-			logger.Error(err)
-			return err
-		}
-	}
-
-	sshSession, err := s.sshClient.NewSession()
+func (s *Ssh) RunTerminal(shell string, rw *websocket.Conn, w, h int, clients *ClientsInfo) (err error) {
+	sshSession, err := s.Connect()
 	if err != nil {
-		logger.Error(err.Error())
 		return err
 	}
 
-	s.sshSession = sshSession
-	s.ws = ws
-
 	defer func() {
 		clients.Delete(s.SessionId)
-		_ = sshSession.Close()
+		_ = s.Close()
 	}()
 
-	sshSession.Stdout = stdout
-	sshSession.Stderr = stderr
-	sshSession.Stdin = stdin
+	sshSession.Stdout = rw
+	sshSession.Stderr = rw
+
+	stdinPipe, _ := sshSession.StdinPipe()
+	go func() {
+		err = ReceiveToWriter(rw, stdinPipe)
+		logger.Error("websocket receive stdin err: ", err)
+		s.Close()
+	}()
 
 	modes := ssh.TerminalModes{}
 
@@ -826,8 +845,7 @@ func (s *Ssh) RunTerminal(shell string, stdout, stderr io.Writer, stdin io.Reade
 		return err
 	}
 
-	err = sshSession.Run(shell)
-	if err != nil {
+	if err = sshSession.Run(shell); err != nil {
 		logger.Error(err.Error())
 		return err
 	}
@@ -859,8 +877,8 @@ func (s *Ssh) Resize(c *gin.Context) {
 		return
 	}
 
-	if cli.(*Ssh).sshSession != nil {
-		_ = cli.(*Ssh).sshSession.WindowChange(h, w)
+	if sshSession := cli.(*Ssh).GetSshSession(); sshSession != nil {
+		_ = sshSession.WindowChange(h, w)
 		str := fmt.Sprintf("W:%d;H:%d\n", w, h)
 		c.JSON(200, gin.H{"code": succeed, "data": str, "msg": "ok"})
 		return
@@ -898,13 +916,12 @@ func SshHandler(c *gin.Context) {
 
 		cli, _ := clients.Load(sessionId)
 
-		err = cli.(*Ssh).RunTerminal(cli.(*Ssh).Shell, ws, ws, ws, w, h, ws)
+		err = cli.(*Ssh).RunTerminal(cli.(*Ssh).Shell, ws, w, h, &clients)
 		if err != nil {
 			_ = websocket.Message.Send(ws, "connect error!!!")
 			clients.Delete(sessionId)
-			_ = ws.Close()
-			return
 		}
+		_ = ws.Close()
 	}).ServeHTTP(response, request)
 }
 
@@ -1273,10 +1290,7 @@ func ConnectGC() {
 		longAgo := time.Now().Add(duration)
 		clients.Range(func(key, item any) bool {
 			if item.(*Ssh).GetTimeout().Before(longAgo) {
-				_ = item.(*Ssh).sshClient.Close()
-				_ = item.(*Ssh).sftpClient.Close()
-				_ = item.(*Ssh).sshSession.Close()
-				_ = item.(*Ssh).ws.Close()
+				_ = item.(*Ssh).Close()
 				clients.Delete(key)
 			}
 			return true
