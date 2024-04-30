@@ -13,13 +13,16 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/creack/pty/v2"
 	"github.com/gin-contrib/sessions"
 	"github.com/gin-contrib/sessions/cookie"
 	"github.com/gin-contrib/sse"
@@ -705,7 +708,7 @@ type Ssh struct {
 	Timeout    time.Time    `json:"timeout"`
 	sshClient  *ssh.Client  //ssh客户端
 	sftpClient *sftp.Client //sftp客户端
-	sshSession *ssh.Session //ssh会话
+	terminal   Terminal     //终端会话
 
 	lock *sync.RWMutex
 }
@@ -713,8 +716,8 @@ type Ssh struct {
 func (s *Ssh) Close() (err error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
-	if s.sshSession != nil {
-		err = s.sshSession.Close()
+	if s.terminal != nil {
+		err = s.terminal.Close()
 	}
 	if s.sftpClient != nil {
 		err = s.sftpClient.Close()
@@ -732,11 +735,11 @@ func (s *Ssh) GetTimeout() time.Time {
 	return timeout
 }
 
-func (s *Ssh) GetSshSession() *ssh.Session {
+func (s *Ssh) GetTerminal() Terminal {
 	s.lock.RLock()
-	session := s.sshSession
+	terminal := s.terminal
 	s.lock.RUnlock()
-	return session
+	return terminal
 }
 
 func (s *Ssh) GetSshInfo() SshInfo {
@@ -777,7 +780,7 @@ func (s SshInfo) MarshalJSON() ([]byte, error) {
 }
 
 // 连接主机
-func (s *Ssh) Connect() (sshSession *ssh.Session, err error) {
+func (s *Ssh) Connect(w, h int) (terminal Terminal, err error) {
 	s.lock.Lock()
 	defer s.lock.Unlock()
 
@@ -797,11 +800,11 @@ func (s *Ssh) Connect() (sshSession *ssh.Session, err error) {
 			return nil, err
 		}
 
-		if s.sshSession, err = s.sshClient.NewSession(); err != nil {
+		if s.terminal, err = NewSshPty(s.sshClient, w, h); err != nil {
 			return nil, err
 		}
 	}
-	return s.sshSession, nil
+	return s.terminal, nil
 }
 
 func ReceiveToWriter(rw *websocket.Conn, w io.Writer) (err error) {
@@ -817,9 +820,14 @@ func ReceiveToWriter(rw *websocket.Conn, w io.Writer) (err error) {
 	return
 }
 
+func SendMessage(rw *websocket.Conn, r io.Reader) (err error) {
+	_, err = io.Copy(rw, r)
+	return
+}
+
 // RunTerminal 运行一个终端
-func (s *Ssh) RunTerminal(shell string, rw *websocket.Conn, w, h int, clients *ClientsInfo) (err error) {
-	sshSession, err := s.Connect()
+func (s *Ssh) RunTerminal(rw *websocket.Conn, w, h int, clients *ClientsInfo) (err error) {
+	terminal, err := s.Connect(w, h)
 	if err != nil {
 		return err
 	}
@@ -829,27 +837,147 @@ func (s *Ssh) RunTerminal(shell string, rw *websocket.Conn, w, h int, clients *C
 		_ = s.Close()
 	}()
 
-	sshSession.Stdout = rw
-	sshSession.Stderr = rw
-
-	stdinPipe, _ := sshSession.StdinPipe()
+	stdinPipe, _ := terminal.StdinPipe()
+	stdoutPipe, _ := terminal.StdoutPipe()
+	stderrPipe, _ := terminal.StderrPipe()
 	go func() {
 		err = ReceiveToWriter(rw, stdinPipe)
 		logger.Error("websocket receive stdin err: ", err)
-		s.Close()
+		_ = s.Close()
+	}()
+	go func() {
+		_ = SendMessage(rw, stdoutPipe)
+		_ = s.Close()
+	}()
+	go func() {
+		if stderrPipe != nil {
+			_ = SendMessage(rw, stderrPipe)
+			_ = s.Close()
+		}
 	}()
 
-	modes := ssh.TerminalModes{}
-
-	if err := sshSession.RequestPty("xterm-256color", h, w, modes); err != nil {
-		return err
-	}
-
-	if err = sshSession.Run(shell); err != nil {
+	if err = terminal.Run(s.Shell); err != nil {
 		logger.Error(err.Error())
 		return err
 	}
 	return nil
+}
+
+type Terminal interface {
+	Start(cmd string) error
+	Run(cmd string) error
+	Wait() error
+	Close() error
+	WindowChange(h, w int) error
+	StdinPipe() (io.WriteCloser, error)
+	StdoutPipe() (io.Reader, error)
+	StderrPipe() (io.Reader, error)
+}
+
+func NewSshPty(sshClient *ssh.Client, w, h int) (t Terminal, err error) {
+	sshSession, err := sshClient.NewSession()
+	if err != nil {
+		return nil, err
+	}
+	modes := ssh.TerminalModes{
+		ssh.ECHO:          1,
+		ssh.TTY_OP_ISPEED: 14400,
+		ssh.TTY_OP_OSPEED: 14400,
+	}
+
+	if err = sshSession.RequestPty("xterm-256color", h, w, modes); err != nil {
+		_ = sshSession.Close()
+		return nil, err
+	}
+	return sshSession, err
+}
+
+type Pty struct {
+	pty *os.File
+	tty *os.File
+	cmd *exec.Cmd
+
+	started bool // true once Start, Run or Shell is invoked.
+}
+
+func NewLocalPty(w, h int) (Terminal, error) {
+	t := new(Pty)
+	var err error
+	t.pty, t.tty, err = pty.Open()
+	if err != nil {
+		return nil, err
+	}
+
+	if w != 0 && h != 0 {
+		if err = t.WindowChange(h, w); err != nil {
+			_ = t.pty.Close() // Best effort.
+			return nil, err
+		}
+	}
+	return t, err
+}
+
+func (t *Pty) Start(cmd string) (err error) {
+	if t.started {
+		return errors.New("pty: session already started")
+	}
+	defer func() { _ = t.tty.Close() }() // Best effort.
+	cmds := strings.Split(cmd, " ")
+	t.cmd = exec.Command(cmds[0], cmds[1:]...)
+	if t.cmd.SysProcAttr == nil {
+		t.cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	t.cmd.SysProcAttr.Setsid = true
+	t.cmd.SysProcAttr.Setctty = true
+	t.cmd.Stdout = t.tty
+	t.cmd.Stderr = t.tty
+	t.cmd.Stdin = t.tty
+	t.started = true
+	return t.cmd.Start()
+}
+
+func (t *Pty) Wait() error {
+	if !t.started {
+		return errors.New("pty: session not started")
+	}
+	defer func() {
+		_ = t.pty.Close()
+		_ = t.tty.Close()
+	}()
+	return t.cmd.Wait()
+}
+
+func (t *Pty) Run(cmd string) error {
+	err := t.Start(cmd)
+	if err != nil {
+		return err
+	}
+	return t.Wait()
+}
+
+func (t *Pty) Close() error {
+	_ = t.pty.Close()
+	_ = t.tty.Close()
+	if t.cmd == nil || t.cmd.Process == nil {
+		return nil
+	}
+	return t.cmd.Process.Kill()
+}
+
+func (t *Pty) WindowChange(h, w int) error {
+	return pty.Setsize(t.pty, &pty.Winsize{Rows: uint16(h), Cols: uint16(w), X: uint16(w * 8), Y: uint16(h * 8)})
+}
+
+func (t *Pty) StdinPipe() (io.WriteCloser, error) {
+	return t.pty, nil
+}
+
+func (t *Pty) StdoutPipe() (io.Reader, error) {
+	return t.pty, nil
+}
+
+func (t *Pty) StderrPipe() (io.Reader, error) {
+	return nil, nil
 }
 
 // Resize 调整终端大小
@@ -877,8 +1005,8 @@ func (s *Ssh) Resize(c *gin.Context) {
 		return
 	}
 
-	if sshSession := cli.(*Ssh).GetSshSession(); sshSession != nil {
-		_ = sshSession.WindowChange(h, w)
+	if terminal := cli.(*Ssh).GetTerminal(); terminal != nil {
+		_ = terminal.WindowChange(h, w)
 		str := fmt.Sprintf("W:%d;H:%d\n", w, h)
 		c.JSON(200, gin.H{"code": succeed, "data": str, "msg": "ok"})
 		return
@@ -898,6 +1026,7 @@ func SshHandler(c *gin.Context) {
 
 	// WebSock 连接 SSH
 	websocket.Handler(func(ws *websocket.Conn) {
+		ws.PayloadType = websocket.BinaryFrame
 		sessionId := ws.Request().URL.Query().Get("session_id")
 		w, err := strconv.Atoi(ws.Request().URL.Query().Get("w"))
 		if err != nil || (w < 40 || w > 8192) {
@@ -916,7 +1045,7 @@ func SshHandler(c *gin.Context) {
 
 		cli, _ := clients.Load(sessionId)
 
-		err = cli.(*Ssh).RunTerminal(cli.(*Ssh).Shell, ws, w, h, &clients)
+		err = cli.(*Ssh).RunTerminal(ws, w, h, &clients)
 		if err != nil {
 			_ = websocket.Message.Send(ws, "connect error!!!")
 			clients.Delete(sessionId)
